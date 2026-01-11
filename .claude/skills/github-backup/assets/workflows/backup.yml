@@ -1,0 +1,279 @@
+# GitHub Repository Backup Workflow
+# Automatically backs up multiple repositories on a schedule
+#
+# Setup:
+# 1. Create a new repository for backups
+# 2. Add BACKUP_PAT secret with repo access
+# 3. Customize the repository list or use config.json
+# 4. Adjust schedule as needed
+
+name: Backup GitHub Repositories
+
+on:
+  schedule:
+    # Daily at 2:00 AM UTC (adjust as needed)
+    - cron: '0 2 * * *'
+
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Comma-separated repos to backup (leave empty for all from config)'
+        required: false
+        default: ''
+      storage:
+        description: 'Storage destination'
+        required: false
+        default: 'github'
+        type: choice
+        options:
+          - github
+          - s3
+          - gcs
+          - local
+
+env:
+  BACKUP_BRANCH: backups
+  RETENTION_COUNT: 7
+
+jobs:
+  # ============================================================================
+  # Load Configuration
+  # ============================================================================
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.load.outputs.repos }}
+      storage: ${{ steps.load.outputs.storage }}
+
+    steps:
+      - name: Checkout backup repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BACKUP_BRANCH }}
+
+      - name: Load repository list
+        id: load
+        run: |
+          # Use input if provided, otherwise load from config
+          if [[ -n "${{ github.event.inputs.repos }}" ]]; then
+            REPOS=$(echo '${{ github.event.inputs.repos }}' | tr ',' '\n' | jq -R . | jq -sc .)
+          elif [[ -f config.json ]]; then
+            REPOS=$(jq -c '.repositories' config.json)
+          else
+            echo "::error::No repositories specified and config.json not found"
+            exit 1
+          fi
+
+          echo "repos=$REPOS" >> $GITHUB_OUTPUT
+          echo "storage=${{ github.event.inputs.storage || 'github' }}" >> $GITHUB_OUTPUT
+          echo "Found $(echo $REPOS | jq 'length') repositories to backup"
+
+  # ============================================================================
+  # Backup Repositories
+  # ============================================================================
+  backup:
+    needs: config
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        repo: ${{ fromJson(needs.config.outputs.repos) }}
+
+    steps:
+      - name: Checkout backup repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BACKUP_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Setup Git LFS
+        run: |
+          git lfs install
+
+      - name: Backup repository
+        id: backup
+        env:
+          GITHUB_TOKEN: ${{ secrets.BACKUP_PAT }}
+        run: |
+          REPO="${{ matrix.repo }}"
+          REPO_NAME="${REPO//\//_}"
+          BACKUP_DIR="backups/${REPO_NAME}"
+          DATE=$(date +%Y-%m-%d_%H-%M-%S)
+          ARCHIVE_NAME="${REPO_NAME}_${DATE}.tar.gz"
+
+          echo "::group::Backing up $REPO"
+
+          mkdir -p "$BACKUP_DIR"
+
+          # Mirror clone
+          echo "Creating mirror clone..."
+          git clone --mirror "https://${GITHUB_TOKEN}@github.com/${REPO}.git" "${REPO_NAME}.git"
+
+          # Fetch LFS objects if present
+          if [[ -d "${REPO_NAME}.git/lfs" ]] || git -C "${REPO_NAME}.git" lfs ls-files 2>/dev/null | head -1; then
+            echo "Fetching Git LFS objects..."
+            cd "${REPO_NAME}.git"
+            git lfs fetch --all || echo "LFS fetch warning (may be expected)"
+            cd ..
+          fi
+
+          # Create archive
+          echo "Creating archive: $ARCHIVE_NAME"
+          tar -czf "${BACKUP_DIR}/${ARCHIVE_NAME}" "${REPO_NAME}.git"
+          cp "${BACKUP_DIR}/${ARCHIVE_NAME}" "${BACKUP_DIR}/${REPO_NAME}_latest.tar.gz"
+
+          # Get size
+          SIZE=$(du -h "${BACKUP_DIR}/${ARCHIVE_NAME}" | cut -f1)
+          echo "Archive size: $SIZE"
+
+          # Cleanup old backups
+          cd "$BACKUP_DIR"
+          ls -t ${REPO_NAME}_2*.tar.gz 2>/dev/null | tail -n +$((RETENTION_COUNT + 1)) | xargs -r rm -f || true
+          cd -
+
+          # Cleanup temp
+          rm -rf "${REPO_NAME}.git"
+
+          echo "::endgroup::"
+
+          # Set outputs
+          echo "archive=${BACKUP_DIR}/${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+
+      - name: Verify backup
+        run: |
+          ARCHIVE="${{ steps.backup.outputs.archive }}"
+          echo "Verifying archive integrity..."
+
+          # Check gzip integrity
+          gzip -t "$ARCHIVE"
+
+          # Quick tar check
+          tar -tzf "$ARCHIVE" > /dev/null
+
+          echo "Backup verified successfully"
+
+      - name: Upload to S3
+        if: needs.config.outputs.storage == 's3'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        run: |
+          ARCHIVE="${{ steps.backup.outputs.archive }}"
+          BUCKET="${{ secrets.S3_BUCKET }}"
+
+          aws s3 cp "$ARCHIVE" "s3://${BUCKET}/backups/$(basename $ARCHIVE)"
+          echo "Uploaded to S3: s3://${BUCKET}/backups/$(basename $ARCHIVE)"
+
+      - name: Upload to GCS
+        if: needs.config.outputs.storage == 'gcs'
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+      - name: GCS Upload
+        if: needs.config.outputs.storage == 'gcs'
+        run: |
+          ARCHIVE="${{ steps.backup.outputs.archive }}"
+          BUCKET="${{ secrets.GCS_BUCKET }}"
+
+          gsutil cp "$ARCHIVE" "gs://${BUCKET}/backups/$(basename $ARCHIVE)"
+          echo "Uploaded to GCS: gs://${BUCKET}/backups/$(basename $ARCHIVE)"
+
+      - name: Commit backup to GitHub
+        if: needs.config.outputs.storage == 'github'
+        run: |
+          REPO="${{ matrix.repo }}"
+          REPO_NAME="${REPO//\//_}"
+
+          git add "backups/${REPO_NAME}/"
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Backup ${REPO} - $(date +%Y-%m-%d)"
+            git push origin ${{ env.BACKUP_BRANCH }}
+          fi
+
+      - name: Upload artifact (local storage)
+        if: needs.config.outputs.storage == 'local'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ matrix.repo }}
+          path: ${{ steps.backup.outputs.archive }}
+          retention-days: 30
+
+  # ============================================================================
+  # Summary & Notifications
+  # ============================================================================
+  notify:
+    needs: [config, backup]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Backup Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Date | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Storage | ${{ needs.config.outputs.storage }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ needs.backup.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Repositories" >> $GITHUB_STEP_SUMMARY
+          echo '${{ needs.config.outputs.repos }}' | jq -r '.[]' | while read repo; do
+            echo "- \`$repo\`" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Send Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ vars.SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ needs.backup.result }}"
+          COLOR="good"
+          [[ "$STATUS" != "success" ]] && COLOR="danger"
+
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"GitHub Backup $STATUS\",
+                \"text\": \"Backup completed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')\",
+                \"fields\": [
+                  {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
+                  {\"title\": \"Storage\", \"value\": \"${{ needs.config.outputs.storage }}\", \"short\": true}
+                ]
+              }]
+            }"
+
+      - name: Send email notification
+        if: failure() && vars.NOTIFICATION_EMAIL != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "GitHub Backup Failed - ${{ github.repository }}"
+          to: ${{ vars.NOTIFICATION_EMAIL }}
+          from: GitHub Actions <noreply@github.com>
+          body: |
+            GitHub backup workflow failed.
+
+            Repository: ${{ github.repository }}
+            Workflow: ${{ github.workflow }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Please check the workflow logs for details.

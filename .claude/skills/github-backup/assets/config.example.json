@@ -1,0 +1,48 @@
+{
+  "repositories": [
+    "owner/repo-1",
+    "owner/repo-2",
+    "organization/project"
+  ],
+  "schedule": "0 2 * * *",
+  "storage": {
+    "type": "github",
+    "branch": "backups",
+    "s3": {
+      "bucket": "my-backup-bucket",
+      "prefix": "github-backups",
+      "region": "us-east-1"
+    },
+    "gcs": {
+      "bucket": "my-backup-bucket",
+      "prefix": "github-backups"
+    },
+    "azure": {
+      "account": "mystorageaccount",
+      "container": "backups",
+      "prefix": "github-backups"
+    }
+  },
+  "retention": {
+    "count": 7,
+    "days": 30
+  },
+  "notifications": {
+    "enabled": true,
+    "slack": {
+      "webhook_url": "",
+      "channel": "#backups"
+    },
+    "email": {
+      "recipients": ["admin@example.com"],
+      "on_failure_only": true
+    }
+  },
+  "discovery": {
+    "enabled": false,
+    "include_private": true,
+    "include_forks": false,
+    "include_archived": false,
+    "organizations": ["my-org"]
+  }
+}

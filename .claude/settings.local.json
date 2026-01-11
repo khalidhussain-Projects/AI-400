@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(fetch-library-docs)",
+      "Skill(browsing-with-playwright)",
+      "Bash(bash scripts/fetch-docs.sh:*)",
+      "WebFetch(domain:sqlmodel.tiangolo.com)",
+      "Skill(skill-creator)",
+      "Bash(python3 scripts/init_skill.py:*)",
+      "Bash(chmod:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}
